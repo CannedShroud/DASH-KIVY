@@ -1,4 +1,5 @@
 from kivy.config import Config
+from kivy.uix.relativelayout import RelativeLayout
 Config.set("graphics", "fullscreen", "auto")
 Config.set('graphics', 'show_cursor', '0')
 
@@ -9,6 +10,8 @@ from kivy.app import App
 from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
 from kivy.uix.label import Label
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.stacklayout import StackLayout
 from kivy.uix.widget import Widget
 from kivy.uix.gridlayout import GridLayout
 from kivy.graphics import Color, Line
@@ -19,6 +22,7 @@ from kivy.clock import Clock
 from kivy.core.image import Image as CoreImage
 from kivy.core.text import Label as CoreLabel
 from kivy.animation import Animation
+from kivy.core.window import Window
 import threading
 import re
 from math import inf
@@ -26,8 +30,9 @@ import random
 import obd
 from enum import Enum
 from os import path
+import time
 
-USE_FAKE_OBD = True
+USE_FAKE_OBD = False
 DIAL_MIN = 18
 DIAL_MAX = -110
 OBD_WIFI_IP = "192.168.0.10"
@@ -265,8 +270,61 @@ DATA = {
     },
 }
 
+class AssistKey(Enum):
+    ECO_STATUS = "eco_status"
+    SHIFT_HINT = "shift_hint"
+    WARMUP_STATUS = "warmup_status"
+    RESPONSIVENESS_LABEL = "responsiveness_label"
+    BATTERY_STATUS = "battery_status"
+    THROTTLE_STYLE = "throttle_style"
+
+
+DRIVER_ASSISTS_STATE = {
+    AssistKey.ECO_STATUS: {
+        "name": "Eco Status",
+        "value": "--",
+        "show": True,
+        "icon": "eco.png",
+    },
+    AssistKey.SHIFT_HINT: {
+        "name": "Shift Hint",
+        "value": "--",
+        "show": True,
+        "icon": "shift.png",
+    },
+    AssistKey.WARMUP_STATUS: {
+        "name": "Engine Warmup Status",
+        "value": "--",
+        "show": True,
+        "icon": "enginecold.png",
+    },
+    AssistKey.RESPONSIVENESS_LABEL: {
+        "name": "Engine Responsiveness",
+        "value": "--",
+        "show": True,
+        "icon": "responsiveness.png",
+    },
+    AssistKey.BATTERY_STATUS: {
+        "name": "Battery Status",
+        "value": "--",
+        "show": True,
+        "icon": "batterywarning.png",
+    },
+    AssistKey.THROTTLE_STYLE: {
+        "name": "Drive Style",
+        "value": "--",
+        "show": True,
+        "icon": "drivestyle.png",
+    }
+}
+
+DRIVER_ASSISTS_INTERNAL_STATE = {
+    "prev_throttle": None
+}
+
 GAUGES_TO_SHOW = [PID.BOOST, PID.IAT, PID.TIMING, PID.COOLANT_TEMP, PID.OIL_TEMP, PID.VOLTAGE]
 DATACELLS_TO_SHOW = [PID.BOOST, PID.IAT, PID.TIMING, PID.COOLANT_TEMP, PID.OIL_TEMP, PID.VOLTAGE]
+WARNINGS_TO_SHOW = [AssistKey.WARMUP_STATUS, AssistKey.BATTERY_STATUS]
 
 FRAME_RE = re.compile(r"Frame ID:\s*([0-9A-Fa-f]+),\s*Data:\s*([0-9A-Fa-f ]+)")
 
@@ -279,9 +337,111 @@ def get_obd_connection():
         print(f"[!] Error connecting to ELM327: {e}")
         return None
 
+def start_driver_assist_calcs():
+    print("[*] Starting Driver Assists thread...")
+    while True:
+        update_driver_assists()
+        time.sleep(0.5)
+        print()
+
+def update_driver_assists():
+    try:
+        throttle = float(DATA[PID.THROTTLE]['value'])
+        load = float(DATA[PID.LOAD]['value'])
+        afr = float(DATA[PID.AFR]['value'])
+        rpm = float(DATA[PID.RPM]['value'])
+        ltft = float(DATA[PID.LTFT]['value'])
+        stft = float(DATA[PID.STFT]['value'])
+        coolant = float(DATA[PID.COOLANT_TEMP]['value'])
+        oil = float(DATA[PID.OIL_TEMP]['value'])
+        timing = float(DATA[PID.TIMING]['value'])
+        iat = float(DATA[PID.IAT]['value'])
+        voltage = float(DATA[PID.VOLTAGE]['value'])
+
+        # 1. Eco DrivingTrue
+        eco = []
+        if load > 80 or throttle > 70 or afr < 0.95:
+            eco.append("Inefficient driving")
+        elif throttle < 20 and rpm > 3000:
+            eco.append("Upshift recommended")
+        if ltft < -5:
+            eco.append("Rich fuel trim detected")
+        DRIVER_ASSISTS_STATE[AssistKey.ECO_STATUS] = "Eco Status: " + (", ".join(eco) if eco else "Good")
+
+        # 2. Shift Suggestion
+        if rpm > 3500 and throttle < 30:
+            DRIVER_ASSISTS_STATE[AssistKey.SHIFT_HINT] = "Shift Hint: Upshift"
+        elif rpm < 1500 and load > 80:
+            DRIVER_ASSISTS_STATE[AssistKey.SHIFT_HINT] = "Shift Hint: Downshift"
+        else:
+            DRIVER_ASSISTS_STATE[AssistKey.SHIFT_HINT] = "Shift Hint: --"
+
+        # 3. Warmup
+        if oil < 40:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["value"] = "Idle"
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = True
+        elif oil < 60 or coolant < 60:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["value"]= "Drive Gently"
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = True
+        elif oil < 80 or coolant < 80:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["value"]  = "Almost Ready"
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = True
+        else:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = False
+
+        # 4. Responsiveness
+        score = 100
+        if iat > 50: score -= 20
+        if abs(ltft) > 5: score -= 20
+        if abs(stft) > 5: score -= 10
+        if timing < 10: score -= 15
+        if load < 20: score -= 10
+        label = "TUNED" if score > 80 else "OK" if score > 50 else "HEATSOAKED" if score > 30 else "DULL"
+        DRIVER_ASSISTS_STATE[AssistKey.RESPONSIVENESS_LABEL] = f"RESPONSIVENESS: {label} ({score})"
+
+        # 5. Battery
+        if voltage < 12.6:
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["value"] = "Low Voltage"
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["show"] = True
+        elif voltage > 14.7:
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["value"] = "Overcharging"
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["show"] = True
+        else:
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["show"] = False
+
+
+        # 6. Throttle Sensitivity Coach
+        prev_throttle = DRIVER_ASSISTS_INTERNAL_STATE.get("prev_throttle")
+        if prev_throttle is None:
+            DRIVER_ASSISTS_INTERNAL_STATE["prev_throttle"] = throttle
+            return
+
+        delta_throttle = abs(throttle - prev_throttle)
+        rate = delta_throttle / 0.5  # 0.5s interval
+
+        if rate > 100:
+            style = "Throttle Style: AGGRESSIVE"
+        elif rate > 20:
+            style = "Throttle Style: MODERATE"
+        else:
+            style = "Throttle Style: SMOOTH"
+
+        DRIVER_ASSISTS_STATE[AssistKey.THROTTLE_STYLE] = style
+        DRIVER_ASSISTS_INTERNAL_STATE["prev_throttle"] = throttle
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("[Assist Error]", e)
+
+
 def start_obd_polling():
     if USE_FAKE_OBD:
         print("[*] Running in FAKE OBD mode.")
+
+        t = threading.Thread(target=start_driver_assist_calcs, daemon=True)
+        t.start()
+
 
         rpm = 800
         throttle = 10
@@ -289,10 +449,18 @@ def start_obd_polling():
         timing = 10
 
         while True:
+            time.sleep(0.5)
             for pid, entry in DATA.items():
                 if pid == PID.RPM:
                     rpm += random.uniform(-150, 300)
-                    rpm = max(700, min(rpm, 5500))
+                    rpm = max(700, min(rpm, 6300))
+                    go = 1
+                    if rpm == 6300:
+                        if go > 5:
+                            rpm = 4200
+                            go = 0
+                        go += 1
+
                     value = rpm
 
                 elif pid == PID.THROTTLE:
@@ -308,10 +476,10 @@ def start_obd_polling():
                     value = random.uniform(35, 65)
 
                 elif pid == PID.COOLANT_TEMP:
-                    value = random.uniform(78, 105)
+                    value = random.uniform(40, 105)
 
                 elif pid == PID.OIL_TEMP:
-                    value = random.uniform(80, 115)
+                    value = random.uniform(40, 105)
 
                 elif pid == PID.STFT:
                     value = random.uniform(-6.5, 6.5)
@@ -353,10 +521,14 @@ def start_obd_polling():
 
     connection = get_obd_connection()
     while not connection or not connection.is_connected():
+
         print("[!] Unable to connect to ELM327. Trying again...")
         connection = get_obd_connection()
 
     print("[*] Starting OBD polling thread...")
+
+    t = threading.Thread(target=start_driver_assist_calcs, daemon=True)
+    t.start()
 
     while True:
         for pid, entry in DATA.items():
@@ -376,120 +548,8 @@ def start_obd_polling():
                     DATA[pid]["min_read"] = str(min(float(DATA[pid]["min_read"]), float(truncated_value)))
                     DATA[pid]["max_read"] = str(max(float(DATA[pid]["max_read"]), float(truncated_value)))
 
-                    print(f"{DATA[pid]['name']} ({pid}): {truncated_value}")
             except Exception as e:
                 print(f"[!] Error querying {pid}: {e}")
-
-class AssistOverlay(BoxLayout):
-    eco_status = StringProperty("Eco Status: --")
-    shift_hint = StringProperty("Shift Hint: --")
-    warmup_status = StringProperty("Engine: --")
-    responsiveness_score = NumericProperty(0)
-    responsiveness_label = StringProperty("RESPONSIVENESS: --")
-    battery_status = StringProperty("Battery: --")
-    throttle_style = StringProperty("Throttle Style: --")
-
-    def __init__(self, **kwargs):
-        super().__init__(orientation='vertical', padding=10, spacing=8, size_hint=(1, 0.3), **kwargs)
-        self.labels = []
-        for prop in ['eco_status', 'shift_hint', 'warmup_status',
-                     'responsiveness_label', 'battery_status', 'throttle_style']:
-            lbl = Label(text=getattr(self, prop), font_size='20sp', halign='left')
-            self.labels.append(lbl)
-            self.add_widget(lbl)
-
-        Clock.schedule_interval(self.update_assists, 0.5)
-
-    def update_assists(self, dt):
-
-        try:
-            throttle = float(DATA[PID.THROTTLE]['value'])
-            load = float(DATA[PID.LOAD]['value'])
-            afr = float(DATA[PID.AFR]['value'])
-            rpm = float(DATA[PID.RPM]['value'])
-            ltft = float(DATA[PID.LTFT]['value'])
-            stft = float(DATA[PID.STFT]['value'])
-            coolant = float(DATA[PID.COOLANT_TEMP]['value'])
-            oil = float(DATA[PID.OIL_TEMP]['value'])
-            timing = float(DATA[PID.TIMING]['value'])
-            iat = float(DATA[PID.IAT]['value'])
-            voltage = float(DATA[PID.VOLTAGE]['value'])
-
-            # 1. Eco Driving Assistant
-            eco = []
-            if load > 80 or throttle > 70 or afr < 0.95:
-                eco.append("Inefficient driving")
-            elif throttle < 20 and rpm > 3000:
-                eco.append("Upshift recommended")
-            if ltft < -5:
-                eco.append("Rich fuel trim detected")
-            self.eco_status = "Eco Status: " + (", ".join(eco) if eco else "Good")
-
-            # 2. Shift Suggestion
-            if rpm > 3500 and throttle < 30:
-                self.shift_hint = "Shift Hint: Upshift"
-            elif rpm < 1500 and load > 80:
-                self.shift_hint = "Shift Hint: Downshift"
-            else:
-                self.shift_hint = "Shift Hint: --"
-
-            # 3. Engine Warm-Up
-            if coolant < 70 or oil < 60:
-                self.warmup_status = "Engine: Cold"
-            elif coolant >= 85 and oil >= 85:
-                self.warmup_status = "Engine: Ready"
-            else:
-                self.warmup_status = "Engine: Warming"
-
-            # 4. Responsiveness Index
-            score = 100
-            if iat > 50: score -= 20
-            if abs(ltft) > 5: score -= 20
-            if abs(stft) > 5: score -= 10
-            if timing < 10: score -= 15
-            if load < 20: score -= 10
-            self.responsiveness_score = max(0, min(100, score))
-            if score > 80:
-                label = "TUNED"
-            elif score > 50:
-                label = "OK"
-            elif score > 30:
-                label = "HEATSOAKED"
-            else:
-                label = "DULL"
-            self.responsiveness_label = f"RESPONSIVENESS: {label} ({score})"
-
-            # 5. Battery Health
-            if voltage < 12.6:
-                self.battery_status = "Battery: Low Voltage"
-            elif voltage > 14.7:
-                self.battery_status = "Battery: Overcharging"
-            else:
-                self.battery_status = "Battery: OK"
-
-            # 6. Throttle Sensitivity Coach
-            if not hasattr(self, '_prev_throttle'):
-                self._prev_throttle = throttle
-                self._prev_time = dt
-                return
-            delta_throttle = abs(throttle - self._prev_throttle)
-            rate = delta_throttle / (dt if dt > 0 else 0.01)
-            if rate > 100:
-                self.throttle_style = "Throttle Style: AGGRESSIVE"
-            elif rate > 20:
-                self.throttle_style = "Throttle Style: MODERATE"
-            else:
-                self.throttle_style = "Throttle Style: SMOOTH"
-            self._prev_throttle = throttle
-
-            for prop, lbl in zip(['eco_status', 'shift_hint', 'warmup_status',
-                                  'responsiveness_label', 'battery_status', 'throttle_style'], self.labels):
-                lbl.text = getattr(self, prop)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print("[Assist Error]", e)
 
 class DataCell(BoxLayout):
     def __init__(self, title, value, min_val, max_val, draw_top=False, draw_left=False, **kwargs):
@@ -517,7 +577,7 @@ class DataCell(BoxLayout):
         self.add_widget(readings_box)
 
         with self.canvas.after:
-            Color(0.7, 0.7, 0.7, 1)  # Gray
+            # Color(0.7, 0.7, 0.7, 1)  # Gray
 
             if self.draw_top:
                 self.top_line = Line(points=[self.x, self.top, self.right, self.top], width=1)
@@ -625,10 +685,174 @@ class GaugeWidget(Widget):
         if self.icon_rect:
             self.icon_rect.pos = (cx - 32, self.top - 120)
 
+class RPMBar(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(orientation="horizontal", **kwargs)
+        self.padding = (15, 0, 0, 0)
+        self.spacing = 0
+        self.redline_rpm  = 6000
+        self._blink_ev    = None
+        self._blink_state = True
+
+        with self.canvas.before:
+            self.bg_texture = CoreImage(
+                path.join(ASSETS_ICONS_PATH, "gradient_bar.png")
+            ).texture
+            self.bg_rect = Rectangle(texture=self.bg_texture,
+                                     pos=self.pos, size=self.size)
+
+            Color(0, 0, 0, 1)
+            self.mask_rect = Rectangle(pos=self.pos, size=self.size)
+
+            # Color(1, 1, 1, 1)
+            # self.border_rect = Line(rectangle=(self.x, self.y,
+            #                                    self.width, self.height),
+            #                          width=1)
+
+        self.bind(pos=self._update_geometry, size=self._update_geometry)
+
+        self.label = Label(
+            text="6300",
+            font_size=56,
+            halign="left",
+            valign="middle",
+            width=160,
+            size_hint=(None, 1),
+            font_name=path.join(ASSETS_FONTS_PATH,
+                                "Michroma", "Michroma-Regular.ttf")
+        )
+        self.label.bind(
+            texture_size=lambda inst, s: setattr(inst, "width", max(160, s[0]))
+        )
+        self.add_widget(self.label)
+
+        Clock.schedule_interval(self._refresh, 1 / 60) 
+
+
+    def _update_geometry(self, *_):
+        self.bg_rect.pos = self.pos
+        self.bg_rect.size = self.size
+
+        # self.border_rect.rectangle = (self.x, self.y, self.width, self.height)
+
+    def _refresh(self, _dt):
+        try:
+            entry = DATA[PID.RPM]
+            rpm_val  = float(entry["value"])
+            rpm_min  = 0
+            rpm_max  = 6300
+
+            rpm_val = max(rpm_min, min(rpm_val, rpm_max))
+            self.label.text = f"{round(rpm_val)}"
+
+            frac = (rpm_val - rpm_min) / (rpm_max - rpm_min) if rpm_max != rpm_min else 0
+            frac = max(0.0, min(frac, 1.0))   # 0 → 1
+
+            mask_width = self.width * (1.0 - frac)
+            self.mask_rect.size = (mask_width, self.height)
+            self.mask_rect.pos = (self.x + self.width - mask_width, self.y)
+            self._handle_redline_blink(rpm_val)
+        except KeyError:
+            self.label.text = "N/A"
+            self.mask_rect.size = (self.width, self.height)
+
+    def _handle_redline_blink(self, rpm_val):
+        if rpm_val >= self.redline_rpm:
+            if self._blink_ev is None:            # start blinking
+                self._blink_ev = Clock.schedule_interval(
+                    self._toggle_blink, 0.15)     # toggle every 150 ms
+        else:
+            if self._blink_ev is not None:        # stop blinking
+                self._blink_ev.cancel()
+                self._blink_ev = None
+                self.opacity = 1            # ensure fully visible
+
+    def _toggle_blink(self, _dt):
+        self._blink_state = not self._blink_state
+        self.opacity = 1 if self._blink_state else 0
+
+class WarningBox(BoxLayout):
+    def __init__(self, title, icon_source, message, assist, **kwargs):
+        super().__init__(
+            orientation="vertical",
+            padding=(1),   # (left, top, right, bottom) in px
+            **kwargs
+        )
+        self.assist = assist
+        self.size_hint = (None, None)
+
+        # Icon centered
+        self.icon = Image(
+            source=path.join(ASSETS_ICONS_PATH, icon_source),
+            size_hint=(None, None),
+            size=(64, 64),
+            pos_hint={"center_x": 0.5},
+        )
+        self.add_widget(self.icon)
+
+        # Label content centered
+        self.label = Label(
+            text=message,
+            font_size=18,
+            halign="center",
+            valign="middle",
+            size_hint=(1, 1),
+            font_name=path.join(ASSETS_FONTS_PATH, "Barlow_Condensed", "BarlowCondensed-Regular.ttf")
+        )
+        self.label.bind(size=self._update_text_size)
+        self.add_widget(self.label)
+
+        Clock.schedule_interval(self._refresh, 2)
+
+    def _update_text_size(self, instance, size):
+        instance.text_size = size
+
+    def _refresh(self, _dt):
+        message = DRIVER_ASSISTS_STATE[self.assist]["value"]
+        show = DRIVER_ASSISTS_STATE[self.assist]["show"]
+        self.label.text = message
+
+        self.opacity  = 1 if show else 0
+        self.disabled = not show
+
 class GaugeScreen(Screen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        layout = GridLayout(cols=3, rows=2, padding=25, spacing=0)
+        window_size = Window.size
+        self.size = window_size
+        root = BoxLayout(orientation="vertical", size=self.size)
+        gauges_layout = GridLayout(
+            cols=3, rows=2,
+            spacing=0,
+            size_hint=(None, None), 
+            width=960, height=490, 
+            pos_hint={"center_x": 0.5}
+        )
+        header_layout = BoxLayout(orientation="horizontal", size_hint=(1, None), height=100)
+
+        with header_layout.canvas.before:
+            Color(0, 0, 0, 1)
+            self.bg_rect = Rectangle(size=header_layout.size, pos=header_layout.pos)
+
+            def update_rect(*_):
+                self.bg_rect.size = header_layout.size
+                self.bg_rect.pos = header_layout.pos
+
+            header_layout.bind(pos=update_rect, size=update_rect)
+
+        # Warnings fixed-width layout
+        warnings_layout = BoxLayout(size_hint=(None, 1), width=120 * len(WARNINGS_TO_SHOW), spacing=10, padding=5)
+        for w in WARNINGS_TO_SHOW:
+            entry = DRIVER_ASSISTS_STATE[w]
+            warning_box = WarningBox(entry["name"], icon_source=entry["icon"], message=entry["value"], assist=w)
+            warnings_layout.add_widget(warning_box)
+
+        # RPM bar fills remaining space
+        rpm_bar = RPMBar(size_hint=(1, 1))
+
+        header_layout.add_widget(warnings_layout)
+        header_layout.add_widget(rpm_bar)
+
 
         self.gauges = []
         self.pid_to_gauge = {}
@@ -638,11 +862,12 @@ class GaugeScreen(Screen):
             gauge = GaugeWidget(entry["unit"], entry["icon"], str(entry["dial_min"]), str(entry["dial_max"]))
             self.pid_to_gauge[pid] = gauge
             self.gauges.append(gauge)
-            layout.add_widget(gauge)
+            gauges_layout.add_widget(gauge)
 
-        self.add_widget(layout)
-        assist = AssistOverlay()
-        self.add_widget(assist)
+        root.add_widget(header_layout)
+        root.add_widget(gauges_layout)
+        self.add_widget(root)
+
         # Clock.schedule_once(self.run_initial_sweep, 0.5)
         Clock.schedule_interval(self.update_all_gauges, GAUGE_UPDATE_INTERVAL)
         # Clock.schedule_interval(update, 1 / 120)
@@ -672,10 +897,8 @@ class GaugeContainer(BoxLayout):
     def __init__(self, label, icon_source, min_val, max_val, **kwargs):
         super().__init__(orientation="vertical", spacing=4, padding=4, **kwargs)
         self.size_hint = (None, None)
-        self.size = (320, 240)
 
         # Icon
-        print(path.join(ASSETS_ICONS_PATH, icon_source))
         self.icon = Image(source=path.join(ASSETS_ICONS_PATH, icon_source), size_hint=(None, None), size=(32, 32))
         self.icon.opacity = 1
         self.icon.allow_stretch = True

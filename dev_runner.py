@@ -8,7 +8,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # ✅ Path to your Kivy app entry file
-COMMAND = ["bash", "-c", "DISPLAY=:0 uv run elm.py"]
+COMMAND = ["bash", "-c", "DISPLAY=:0 uv run wifi.py"]
 
 # ✅ Debounce delay
 RELOAD_DELAY = 0.8
