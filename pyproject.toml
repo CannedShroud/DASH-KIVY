@@ -1,0 +1,11 @@
+[project]
+name = "dash-kivy"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "kivy>=2.3.1",
+    "obd>=0.7.3",
+    "watchdog>=6.0.0",
+]
