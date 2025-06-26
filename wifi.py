@@ -330,8 +330,8 @@ FRAME_RE = re.compile(r"Frame ID:\s*([0-9A-Fa-f]+),\s*Data:\s*([0-9A-Fa-f ]+)")
 
 def get_obd_connection():
     try:
-        connection = obd.OBD(f"socket://{OBD_WIFI_IP}:{OBD_WIFI_PORT}")  
-        print("[*] OBD WiFi connection:", "Connected" if connection.is_connected() else "Failed")
+        connection = obd.Async(f"socket://{OBD_WIFI_IP}:{OBD_WIFI_PORT}") 
+        print("[*] OBD WiFi connection established.")
         return connection
     except Exception as e:
         print(f"[!] Error connecting to ELM327: {e}")
@@ -434,6 +434,37 @@ def update_driver_assists():
         traceback.print_exc()
         print("[Assist Error]", e)
 
+def update_data_from_obd(response):
+    if response.is_null() or response.value is None:
+        return
+
+    pid_key = None
+    for key, entry in DATA.items():
+        if entry["obd"].name == response.command.name:
+            pid_key = key
+            break
+
+    if not pid_key:
+        # print(f"[*] Received response for un-tracked command: {response.command.name}")
+        return
+
+    try:
+        pid_entry = DATA[pid_key]
+        raw_value = response.value.magnitude
+
+        converted_value = raw_value 
+
+        converted_value = pid_entry["convert"](raw_value)
+        precision = pid_entry["precision"]
+
+        truncated_value = f"{converted_value:.{precision}f}"
+
+        pid_entry["value"] = truncated_value
+        pid_entry["min_read"] = str(min(float(pid_entry["min_read"]), float(truncated_value)))
+        pid_entry["max_read"] = str(max(float(pid_entry["max_read"]), float(truncated_value)))
+
+    except Exception as e:
+        print(f"[!] Error processing response for {pid_key}: {e}")
 
 def start_obd_polling():
     if USE_FAKE_OBD:
@@ -519,37 +550,22 @@ def start_obd_polling():
                 entry["min_read"] = str(min(float(entry["min_read"]), float(truncated)))
                 entry["max_read"] = str(max(float(entry["max_read"]), float(truncated)))
 
-    connection = get_obd_connection()
-    while not connection or not connection.is_connected():
+    connection = None
 
-        print("[!] Unable to connect to ELM327. Trying again...")
+    while not connection:
         connection = get_obd_connection()
+        if not connection:
+            print("[!] Unable to connect to ELM327. Trying again seconds...")
 
     print("[*] Starting OBD polling thread...")
 
     t = threading.Thread(target=start_driver_assist_calcs, daemon=True)
     t.start()
 
-    while True:
-        for pid, entry in DATA.items():
-            try:
-                cmd = entry["obd"]
-                response = connection.query(cmd)
-                if not response.is_null() and response.value is not None:
-                    raw_value = response.value.magnitude
-                    converted_value = DATA[pid]["convert"](raw_value) if pid != "42" else raw_value  # already V
-                    precision = DATA[pid]["precision"]
-
-                    # Truncate value to desired precision (as string), no rounding
-                    truncated_value = f"{converted_value:.{precision}f}"
-
-                    # Store and update fields
-                    DATA[pid]["value"] = truncated_value
-                    DATA[pid]["min_read"] = str(min(float(DATA[pid]["min_read"]), float(truncated_value)))
-                    DATA[pid]["max_read"] = str(max(float(DATA[pid]["max_read"]), float(truncated_value)))
-
-            except Exception as e:
-                print(f"[!] Error querying {pid}: {e}")
+    for pid, entry in DATA.items():
+        cmd = entry["obd"]
+        connection.watch(cmd, callback=update_data_from_obd, force=True)
+    connection.start()
 
 class DataCell(BoxLayout):
     def __init__(self, title, value, min_val, max_val, draw_top=False, draw_left=False, **kwargs):
