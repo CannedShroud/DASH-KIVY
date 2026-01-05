@@ -5,86 +5,180 @@ import random
 import threading
 import sys
 import os
+from enum import Enum
 
 # Configuration
 HOST = '0.0.0.0'
 PORT = int(os.environ.get("OBD_PORT", 35000))
 
+class Scenario(Enum):
+    COLD_START = 1
+    NORMAL_ECO = 2
+    AGGRESSIVE = 3
+    ISSUES = 4
+
 # OBD Data State
 class VehicleState:
     def __init__(self):
+        self.scenario = Scenario.COLD_START
+        self.start_time = time.time()
+        self.scenario_timer = time.time()
+        
+        # Physics State
         self.rpm = 800.0
         self.speed = 0.0
         self.throttle = 0.0
-        self.coolant = 85.0
-        self.oil = 90.0
-        self.intake_temp = 30.0
+        
+        # Temperatures
+        self.coolant = 20.0
+        self.oil = 20.0
+        self.intake_temp = 25.0
+        
+        # Electrical
         self.voltage = 14.1
+        
+        # Air/Fuel
         self.load = 20.0
-        self.map_pressure = 100.0 # kPa
+        self.map_pressure = 30.0 # kPa
         self.timing = 15.0 # degrees
         self.stft = 0.0
-        self.ltft = 2.3
+        self.ltft = 0.0
         self.maf = 5.0
+        self.afr_lambda = 1.0
         
-        # Simulation flags
+        # Simulation Internal
         self.target_rpm = 800
         self.accelerating = False
 
-    def update(self):
-        """Updates vehicle physics"""
-        # RPM Logic
-        if self.accelerating:
-            self.target_rpm = 6500
-            step = 150
-        else:
-            self.target_rpm = 800
-            step = 100
+    def change_scenario(self):
+        # Cycle scenarios every 30 seconds
+        now = time.time()
+        if now - self.scenario_timer > 30:
+            modes = list(Scenario)
+            current_idx = modes.index(self.scenario)
+            next_idx = (current_idx + 1) % len(modes)
+            self.scenario = modes[next_idx]
+            self.scenario_timer = now
+            print(f"[*] Switching Scenario to: {self.scenario.name}")
             
+            # Reset some values on switch
+            if self.scenario == Scenario.COLD_START:
+                self.coolant = 20
+                self.oil = 20
+            elif self.scenario == Scenario.ISSUES:
+                self.voltage = 11.5 # Start low
+                self.ltft = 10 # Lean condition?
+            
+
+    def update(self):
+        """Updates vehicle physics based on current scenario"""
+        self.change_scenario()
+        
+        # --- SCENARIO LOGIC ---
+        if self.scenario == Scenario.COLD_START:
+            # High Idle, Warming up
+            target_idle = 1200 if self.coolant < 50 else 800
+            self.target_rpm = target_idle + (random.uniform(-20, 20))
+            self.throttle = 0
+            
+            # Warmup
+            self.coolant += 0.2
+            self.oil += 0.1
+            
+            self.voltage = 14.2
+            self.afr_lambda = 0.95 # Rich for warmup
+            self.intake_temp = 25
+
+        elif self.scenario == Scenario.NORMAL_ECO:
+            # Gentle driving
+            if random.random() < 0.05: 
+                self.accelerating = not self.accelerating
+            
+            self.target_rpm = 2500 if self.accelerating else 800
+            step = 50
+            
+            self.coolant = 90 + random.uniform(-2, 2)
+            self.oil = 95 + random.uniform(-1, 1)
+            self.voltage = 13.8 + random.uniform(-0.1, 0.1)
+            self.afr_lambda = 1.0 # Stoich
+            self.intake_temp = 35
+            
+            # Trims good
+            self.stft = random.uniform(-3, 3)
+            self.ltft = random.uniform(-2, 2)
+
+        elif self.scenario == Scenario.AGGRESSIVE:
+            # WOT pulls
+            if random.random() < 0.1:
+                self.accelerating = not self.accelerating
+            
+            self.target_rpm = 6500 if self.accelerating else 3000
+            step = 300 # Fast revs
+            
+            self.coolant = 95 + random.uniform(0, 5)
+            self.oil = 105 + random.uniform(0, 5)
+            self.afr_lambda = 0.85 if self.accelerating else 1.0 # Rich power
+            self.voltage = 14.4
+            
+        elif self.scenario == Scenario.ISSUES:
+            # Problems
+            self.target_rpm = 800 + random.uniform(-100, 100) # Rough idle
+            self.voltage = 11.2 + random.uniform(-0.5, 0.5) # Dying battery/Alt
+            self.intake_temp = 65 + random.uniform(0, 5) # Heat soak
+            self.ltft = -15 # Rich leak?
+            self.stft = -10
+            self.coolant = 108 # Overheating
+            self.oil = 115
+            self.afr_lambda = 0.8 # Running rich
+            
+        # --- PHYSICS ---
+        
+        # RPM smoothing
         if self.rpm < self.target_rpm:
-            self.rpm += step + random.uniform(-10, 10)
-        elif self.rpm > self.target_rpm:
-            self.rpm -= step + random.uniform(-10, 10)
+            self.rpm += (self.target_rpm - self.rpm) * 0.1
+        else:
+            self.rpm -= (self.rpm - self.target_rpm) * 0.1
             
         # Clamp RPM
         self.rpm = max(0, min(self.rpm, 7200))
         
-        # Derived values
-        self.throttle = (self.rpm / 7000.0) * 100.0 if self.accelerating else 0.0
+        # Speed (gear ratio simulation)
         self.speed = (self.rpm / 200.0) if self.rpm > 1000 else 0
         
-        # Boost/Vacuum (MAP)
-        # Idle ~30kPa (vacuum), WOT ~200kPa (boost)
+        # Load / Map
+        if self.scenario == Scenario.AGGRESSIVE:
+            self.throttle = (self.rpm / 7000) * 100
+            self.load = 80 + (self.throttle * 0.2)
+        else:
+            self.throttle = (self.rpm / 3000) * 30
+            self.load = 20 + (self.throttle * 0.5)
+            
         if self.throttle > 50:
             self.map_pressure = 100 + ((self.throttle - 50) * 2) # Boost
         else:
-            self.map_pressure = 30 + (self.throttle * 1.4) # Vacuum to Atmos
+            self.map_pressure = 30 + (self.throttle * 1.4) # Vacuum
             
-        # Random noise
-        self.coolant += random.uniform(-0.1, 0.1)
-        self.voltage = 13.8 + random.uniform(-0.2, 0.4)
-        
-        # Clamp Temps
-        self.coolant = max(80, min(self.coolant, 105))
+        # Timing (simple map)
+        self.timing = 25 - (self.load / 5)
+
+        # Limits
+        self.coolant = max(0, min(self.coolant, 130))
+        self.oil = max(0, min(self.oil, 140))
 
 state = VehicleState()
 
 def physics_loop():
     while True:
         state.update()
-        # Toggle acceleration periodically
-        if random.random() < 0.05:
-            state.accelerating = not state.accelerating
-        time.sleep(0.05)
+        time.sleep(0.1)
 
 def format_hex_byte(val):
-    return f"{int(val):02X}"
+    val = max(0, min(int(val), 255))
+    return f"{val:02X}"
 
 def handle_pid(pid_hex):
     """Returns the hex data for a given PID"""
-    # MAP: Mode 01
     
-    # Standard PIDs
     if pid_hex == "0C": # RPM (2 bytes, 1/4 rpm)
         val = int(state.rpm * 4)
         return f"{val:04X}"
@@ -118,11 +212,11 @@ def handle_pid(pid_hex):
         
     elif pid_hex == "06": # STFT (1 byte)
         # (A - 128) * 100/128
-        val = int((state.stft * 1.28) + 128)
+        val = int((state.stft / (100.0/128.0)) + 128)
         return format_hex_byte(val)
 
     elif pid_hex == "07": # LTFT
-        val = int((state.ltft * 1.28) + 128)
+        val = int((state.ltft / (100.0/128.0)) + 128)
         return format_hex_byte(val)
     
     elif pid_hex == "0E": # Timing (1 byte, A/2 - 64)
@@ -133,9 +227,10 @@ def handle_pid(pid_hex):
         return "64" # 100 kPa
         
     elif pid_hex == "44": # AFR (2 bytes, lambda)
-        return "8000" # 1.0 lambda
+        # Ratio = A / 32768
+        val = int(state.afr_lambda * 32768)
+        return f"{val:04X}"
 
-    # Default to 00 if unknown
     return "00"
 
 def handle_client(conn, addr):
@@ -144,15 +239,9 @@ def handle_client(conn, addr):
     try:
         while True:
             data = conn.recv(1024)
-            if not data:
-                break
+            if not data: break
             
             raw_msg = data.decode('utf-8', errors='ignore')
-            # Handle multiple commands in one packet, usually separated by \r
-            # BUT ELM327 receives character by character usually.
-            # We'll assume the client sends a full command ending with \r
-            
-            # Simple buffer accumulation
             buffer += raw_msg
             
             while '\r' in buffer:
@@ -160,57 +249,17 @@ def handle_client(conn, addr):
                 cmd = buffer[:cmd_end].strip()
                 buffer = buffer[cmd_end+1:]
                 
-                if not cmd:
-                    continue
+                if not cmd: continue
                     
-                # print(f"[RX] {cmd}")
-                
                 response = ""
                 
-                # --- COMMAND HANDLING ---
-                
-                # AT Commands (Configuration)
                 if cmd.startswith("AT"):
-                    if cmd == "ATZ":
-                        response = "\r\nELM327 v1.5\r\nOK"
-                    elif cmd == "ATI":
-                        response = "ELM327 v1.5"
-                    else:
-                        response = "OK"
+                    if cmd == "ATZ": response = "\r\nELM327 v1.5\r\nOK"
+                    else: response = "OK"
                 
-                # Mode 01 Commands (Data)
-                # Formats: "010C" (Single) or "010C0D05..." (Batch)
                 elif cmd.startswith("01"):
                     pids_str = cmd[2:]
-                    # Parse PIDs in pairs of 2 chars
-                    # e.g. 0C 0D 05
                     request_pids = [pids_str[i:i+2] for i in range(0, len(pids_str), 2)]
-                    
-                    data_bytes = ""
-                    for pid in request_pids:
-                        data_bytes += handle_pid(pid)
-                    
-                    # Echo the command? 
-                    # Usually ELM327 echos unless ATE0.
-                    # We will just send the response 41 ...
-                    # The response format for multiple PIDs is contiguous
-                    # 41 [PID1] [DATA1] [PID2] [DATA2] ...
-                    
-                    # Wait... standard ELM327 doesn't natively support arbitrary batching 
-                    # like "010C0D" in one go unless it's a specific CAN request, 
-                    # but python-obd and many apps use this trick if the protocol allows.
-                    # wifi.py sends "010C0B0E..." as one string.
-                    # We need to constructing the response:
-                    # 41 + payload
-                    
-                    # However, strictly speaking, 01 0C 0D is NOT standard OBD-II. 
-                    # Standard is one PID per request.
-                    # But some "Fast" implementations support it or the ECU supports it.
-                    # wifi.py expects the response to contain the PIDs too?
-                    # Let's check wifi.py:
-                    #     parse_batch_response checks: if current_data.startswith(pid_hex): ...
-                    # So wifi.py expects the response to include the PID before the data.
-                    # e.g. 41 0C [2bytes] 0D [1byte] ...
                     
                     sim_response_payload = ""
                     for pid in request_pids:
@@ -218,14 +267,9 @@ def handle_client(conn, addr):
                         sim_response_payload += handle_pid(pid)
                         
                     response = f"41{sim_response_payload}"
-                    
                 else:
                     response = "?"
                     
-                # Finalize Response
-                # ELM327 format:
-                # [Data]\r\n>
-                
                 full_response = f"{response}\r\n>"
                 conn.sendall(full_response.encode('ascii'))
                 
@@ -233,10 +277,8 @@ def handle_client(conn, addr):
         print(f"[!] Error: {e}")
     finally:
         conn.close()
-        print(f"[*] Connection closed {addr}")
 
 def main():
-    # Start physics thread
     t = threading.Thread(target=physics_loop, daemon=True)
     t.start()
     
@@ -246,12 +288,11 @@ def main():
     try:
         server.bind((HOST, PORT))
         server.listen(5)
-        print(f"[*] OBD Simulator listening on {HOST}:{PORT}")
-        print("    Press Ctrl+C to stop.")
+        print(f"[*] Advanced OBD Simulator (Scenarios: Cold -> Eco -> Aggro -> Issues)")
+        print(f"[*] Listening on {HOST}:{PORT}")
         
         while True:
             conn, addr = server.accept()
-            # Handle client in a thread
             ct = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
             ct.start()
             

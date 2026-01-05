@@ -1,0 +1,43 @@
+{
+    "gauges": [
+        "BOOST",
+        "IAT",
+        "TIMING",
+        "COOLANT_TEMP",
+        "OIL_TEMP",
+        "VOLTAGE"
+    ],
+    "datacells": [
+        "BOOST",
+        "IAT",
+        "TIMING",
+        "COOLANT_TEMP",
+        "OIL_TEMP",
+        "VOLTAGE"
+    ],
+    "redline": 5500,
+    "warnings": [
+        "WARMUP_STATUS",
+        "BATTERY_STATUS",
+        "ECO_STATUS",
+        "SHIFT_HINT",
+        "RESPONSIVENESS_LABEL",
+        "THROTTLE_STYLE"
+    ],
+    "fast_pids": [
+        "BOOST",
+        "AFR"
+    ],
+    "slow_pids": [
+        "TIMING",
+        "RPM",
+        "STFT",
+        "THROTTLE",
+        "IAT",
+        "COOLANT_TEMP",
+        "OIL_TEMP",
+        "LTFT",
+        "VOLTAGE",
+        "LOAD"
+    ]
+}

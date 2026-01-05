@@ -14,6 +14,12 @@ from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.stacklayout import StackLayout
 from kivy.uix.widget import Widget
 from kivy.uix.gridlayout import GridLayout
+from kivy.uix.button import Button
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.checkbox import CheckBox
+from kivy.uix.textinput import TextInput
+from kivy.uix.popup import Popup
+
 from kivy.graphics import Color, Line
 from kivy.uix.image import Image
 from kivy.graphics import Rectangle, Rotate, PushMatrix, PopMatrix, Translate
@@ -34,6 +40,7 @@ import time
 import socket
 import select
 import os
+from config_manager import config_manager
 
 USE_FAKE_OBD = False
 
@@ -86,28 +93,20 @@ DATA = {
 # 1. FAST PIDS: Updated instantly.
 # WARNING: Keep total response bytes <= 7 for instant updates.
 # Calculation: 1 byte (Header) + Sum(1 byte PID + N bytes Data for each PID)
-FAST_PIDS = [
-    PID.RPM,        # X-Axis for all data
-    PID.BOOST,      # To catch the 16+ PSI spikes
-    PID.TIMING,     # To see Knock Retard (timing pull) immediately
-    PID.THROTTLE,   # Vital: Reveals if ECU is fighting the boost spike
-    PID.STFT        # Short Term Fuel Trim: Safety check for lean spikes
-]
+FAST_PIDS_KEYS = config_manager.get("fast_pids")
+FAST_PIDS = [getattr(PID, k) for k in FAST_PIDS_KEYS if hasattr(PID, k)]
 
 # 2. SLOW PIDS: Updated every 10th cycle (Temps, Voltages, etc)
 # Focused on Thermal Management (Altroz weakness) and General Health.
-SLOW_PIDS = [
-    PID.IAT,           # #1 Priority for Altroz: Monitor Heat Soak
-    PID.COOLANT_TEMP,  # Safety baseline
-    PID.OIL_TEMP,      # Do not push hard until > 80C
-    PID.LTFT,          # Long Term Fuel Trim: Checks for vacuum leaks/injector health
-    PID.VOLTAGE,       # Alternator health
-    PID.LOAD           # Engine Load %
-]
+SLOW_PIDS_KEYS = config_manager.get("slow_pids")
+SLOW_PIDS = [getattr(PID, k) for k in SLOW_PIDS_KEYS if hasattr(PID, k)]
 
 # 3. UI CONFIG: Which gauges/cells appear on screen
-GAUGES_TO_SHOW = [PID.BOOST, PID.IAT, PID.STFT, PID.COOLANT_TEMP, PID.OIL_TEMP, PID.VOLTAGE]
-DATACELLS_TO_SHOW = [PID.BOOST, PID.IAT, PID.STFT, PID.COOLANT_TEMP, PID.OIL_TEMP, PID.VOLTAGE]
+GAUGES_KEYS = config_manager.get("gauges")
+GAUGES_TO_SHOW = [getattr(PID, k) for k in GAUGES_KEYS if hasattr(PID, k)]
+
+DATACELLS_KEYS = config_manager.get("datacells")
+DATACELLS_TO_SHOW = [getattr(PID, k) for k in DATACELLS_KEYS if hasattr(PID, k)]
 
 # ============================================================================
 
@@ -129,7 +128,8 @@ DRIVER_ASSISTS_STATE = {
 }
 
 DRIVER_ASSISTS_INTERNAL_STATE = { "prev_throttle": None }
-WARNINGS_TO_SHOW = [AssistKey.WARMUP_STATUS, AssistKey.BATTERY_STATUS]
+WARNINGS_KEYS = config_manager.get("warnings")
+WARNINGS_TO_SHOW = [getattr(AssistKey, k) for k in WARNINGS_KEYS if hasattr(AssistKey, k)]
 
 # --- HELPER FUNCTIONS FOR CONFIGURATION ---
 
@@ -280,6 +280,10 @@ def start_obd_polling():
                     if not chunk: raise ConnectionError("Lost connection")
                     buffer += chunk
                 parse_batch_response(buffer, SLOW_PIDS)
+            
+            # Update driver assists periodically
+            if loop_count % 5 == 0:
+                update_driver_assists()
 
             loop_count += 1
             
@@ -297,7 +301,98 @@ def start_obd_polling():
 # --- UI CLASSES START HERE (UNMODIFIED) ---
 
 def update_driver_assists():
-    pass
+    try:
+        throttle = float(DATA[PID.THROTTLE]["value"])
+        load = float(DATA[PID.LOAD]["value"])
+        # Check if AFR is available (it might be 0 if not polled yet or not in config)
+        afr = float(DATA[PID.AFR]["value"]) if DATA[PID.AFR]["value"] != "--" else 14.7 
+        rpm = float(DATA[PID.RPM]["value"])
+        ltft = float(DATA[PID.LTFT]["value"])
+        stft = float(DATA[PID.STFT]["value"])
+        coolant = float(DATA[PID.COOLANT_TEMP]["value"])
+        oil = float(DATA[PID.OIL_TEMP]["value"])
+        timing = float(DATA[PID.TIMING]["value"])
+        iat = float(DATA[PID.IAT]["value"])
+        voltage = float(DATA[PID.VOLTAGE]["value"])
+
+        # 1. Eco DrivingTrue
+        eco = []
+        if load > 80 or throttle > 70 or afr < 0.95:
+            eco.append("Inefficient")
+        elif throttle < 20 and rpm > 3000:
+            eco.append("Upshift")
+        if ltft < -5:
+            eco.append("Rich trim")
+        
+        # Mapping to existing AssistKey.ECO_STATUS
+        DRIVER_ASSISTS_STATE[AssistKey.ECO_STATUS]["value"] = ", ".join(eco) if eco else "ECO"
+
+        # 2. Shift Suggestion
+        if rpm > 3500 and throttle < 30:
+            DRIVER_ASSISTS_STATE[AssistKey.SHIFT_HINT]["value"] = "SHIFT ^"
+        elif rpm < 1500 and load > 80:
+            DRIVER_ASSISTS_STATE[AssistKey.SHIFT_HINT]["value"] = "SHIFT v"
+        else:
+            DRIVER_ASSISTS_STATE[AssistKey.SHIFT_HINT]["value"] = "--"
+
+        # 3. Warmup
+        if oil < 40:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["value"] = "Idle"
+            # DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = True
+        elif oil < 60 or coolant < 60:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["value"]= "Gentle"
+            # DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = True
+        elif oil < 80 or coolant < 80:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["value"]  = "Warm"
+            # DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = True
+        else:
+            DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["value"] = "OK"
+            # DRIVER_ASSISTS_STATE[AssistKey.WARMUP_STATUS]["show"] = False
+
+        # 4. Responsiveness
+        score = 100
+        if iat > 50: score -= 20
+        if abs(ltft) > 5: score -= 20
+        if abs(stft) > 5: score -= 10
+        if timing < 10: score -= 15
+        if load < 20: score -= 10
+        
+        # label = "TUNED" if score > 80 else "OK" if score > 50 else "HEATSOAKED" if score > 30 else "DULL"
+        # We don't have a label for Responsiveness in the original UI, 
+        # but we have AssistKey.RESPONSIVENESS_LABEL defined in Python but not shown in WARNINGS_TO_SHOW by default.
+        # We'll update usage if it exists.
+        DRIVER_ASSISTS_STATE[AssistKey.RESPONSIVENESS_LABEL]["value"] = f"{score}%"
+
+        # 5. Battery
+        if voltage < 12.6:
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["value"] = "LOW"
+        elif voltage > 14.7:
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["value"] = "HIGH"
+        else:
+            DRIVER_ASSISTS_STATE[AssistKey.BATTERY_STATUS]["value"] = "OK"
+
+        # 6. Throttle Sensitivity Coach
+        prev_throttle = DRIVER_ASSISTS_INTERNAL_STATE.get("prev_throttle")
+        if prev_throttle is None:
+            DRIVER_ASSISTS_INTERNAL_STATE["prev_throttle"] = throttle
+            return
+
+        delta_throttle = abs(throttle - prev_throttle)
+        rate = delta_throttle / 0.5  # 0.5s interval
+
+        if rate > 100:
+            style = "AGGRESSIVE"
+        elif rate > 20:
+            style = "MODERATE"
+        else:
+            style = "SMOOTH"
+
+        DRIVER_ASSISTS_STATE[AssistKey.THROTTLE_STYLE]["value"] = style
+        DRIVER_ASSISTS_INTERNAL_STATE["prev_throttle"] = throttle
+
+    except Exception as e:
+        # print("[Assist Error]", e)
+        pass
 
 class DataCell(BoxLayout):
     def __init__(self, title, value, min_val, max_val, draw_top=False, draw_left=False, **kwargs):
@@ -456,7 +551,10 @@ class GaugeScreen(Screen):
         window_size = Window.size
         self.size = window_size
         root = BoxLayout(orientation="vertical", size=self.size)
-        gauges_layout = GridLayout(cols=3, rows=2, spacing=0, size_hint=(None, None), width=960, height=490, pos_hint={"center_x": 0.5})
+        # Fix: Remove fixed rows to allow expansion, though size_hint=(None, None) usually needs explicit sizing or ScrollView.
+        # Given it's a dashboard, we might want to keep it fixed but allow more rows if needed.
+        # Changing rows to None (default) or automatic based on children.
+        gauges_layout = GridLayout(cols=3, spacing=0, size_hint=(None, None), width=960, height=490, pos_hint={"center_x": 0.5})
         header_layout = BoxLayout(orientation="horizontal", size_hint=(1, None), height=100)
         with header_layout.canvas.before:
             Color(0, 0, 0, 1)
@@ -471,8 +569,15 @@ class GaugeScreen(Screen):
             warning_box = WarningBox(entry["name"], icon_source=entry["icon"], message=entry["value"], assist=w)
             warnings_layout.add_widget(warning_box)
         rpm_bar = RPMBar(size_hint=(1, 1))
+        
+        # Settings Button
+        settings_btn = Button(text="CONFIG", size_hint=(None, 1), width=80, background_color=(0.2, 0.2, 0.2, 1))
+        settings_btn.bind(on_release=self.go_to_settings)
+        
         header_layout.add_widget(warnings_layout)
         header_layout.add_widget(rpm_bar)
+        header_layout.add_widget(settings_btn)
+        
         self.gauges = []
         self.pid_to_gauge = {}
         for pid in GAUGES_TO_SHOW:
@@ -487,6 +592,11 @@ class GaugeScreen(Screen):
         Clock.schedule_interval(self.update_all_gauges, GAUGE_UPDATE_INTERVAL)
     def update_all_gauges(self, dt):
         for pid, gauge in self.pid_to_gauge.items(): self.update_gauge(pid, gauge)
+    
+    def go_to_settings(self, *args):
+        self.parent.current = 'settings'
+        self.parent.transition.direction = 'left'
+
     def update_gauge(self, pid, gauge):
         entry = DATA[pid]
         val = float(entry["value"])
@@ -526,13 +636,88 @@ class DigitalScreen(Screen):
             max_ = float(entry["max_read"])
             cell.update_readings(val, min_, max_)
         
+class SettingsScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        
+        # Header
+        header = BoxLayout(size_hint=(1, None), height=50)
+        header.add_widget(Label(text="Settings", font_size=32, bold=True))
+        back_btn = Button(text="Back", size_hint=(None, 1), width=100)
+        back_btn.bind(on_release=self.go_back)
+        header.add_widget(back_btn)
+        self.layout.add_widget(header)
+
+        # Scrollable Content
+        scroll = ScrollView()
+        content = GridLayout(cols=1, spacing=10, size_hint_y=None)
+        content.bind(minimum_height=content.setter('height'))
+
+        # 1. Configurable Gauges
+        content.add_widget(Label(text="Active Gauges", size_hint_y=None, height=40, font_size=24))
+        self.gauge_toggles = {}
+        gauges_grid = GridLayout(cols=3, spacing=5, size_hint_y=None)
+        gauges_grid.bind(minimum_height=gauges_grid.setter('height'))
+        
+        current_gauges = config_manager.get("gauges")
+        for pid_name in PID.__members__:
+            box = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+            chk = CheckBox(active=(pid_name in current_gauges))
+            box.add_widget(chk)
+            box.add_widget(Label(text=pid_name))
+            self.gauge_toggles[pid_name] = chk
+            gauges_grid.add_widget(box)
+        
+        content.add_widget(gauges_grid)
+
+        # 2. Redline
+        content.add_widget(Label(text="Redline RPM", size_hint_y=None, height=40, font_size=24))
+        self.redline_input = TextInput(text=str(config_manager.get("redline")), multiline=False, size_hint_y=None, height=40)
+        content.add_widget(self.redline_input)
+        
+        # Save Button
+        save_btn = Button(text="Save & Restart", size_hint_y=None, height=60, background_color=(0, 1, 0, 1))
+        save_btn.bind(on_release=self.save_config)
+        content.add_widget(save_btn)
+
+        scroll.add_widget(content)
+        self.layout.add_widget(scroll)
+        self.add_widget(self.layout)
+
+    def go_back(self, *args):
+        self.manager.current = 'gauge'
+        self.manager.transition.direction = 'right'
+
+    def save_config(self, *args):
+        # Update Gauges
+        new_gauges = [k for k, v in self.gauge_toggles.items() if v.active]
+        config_manager.set("gauges", new_gauges)
+        
+        # Update Redline
+        try:
+            new_redline = int(self.redline_input.text)
+            config_manager.set("redline", new_redline)
+        except ValueError:
+            pass
+            
+        # Show Popup
+        popup = Popup(title='Saved',
+                      content=Label(text='Settings saved!\nPlease restart the app.'),
+                      size_hint=(None, None), size=(400, 200))
+        popup.open()
+
 class RootWidget(ScreenManager):
     def __init__(self, **kwargs):
         super().__init__(transition=SlideTransition(duration=0.4), **kwargs)
         self.add_widget(GaugeScreen(name='gauge'))
         self.add_widget(DigitalScreen(name='digital'))
+        self.add_widget(SettingsScreen(name='settings'))
         self.current = 'gauge'
     def on_touch_move(self, touch):
+        # Disabled swipe for settings to avoid accidental confusion
+        if self.current == 'settings': return
+        
         if touch.dx < -40: self.switch_to_screen('digital')
         elif touch.dx > 40: self.switch_to_screen('gauge')
     def switch_to_screen(self, name):
