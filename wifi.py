@@ -50,7 +50,9 @@ OBD_WIFI_IP = os.environ.get("OBD_HOST", "192.168.0.10")
 OBD_WIFI_PORT = int(os.environ.get("OBD_PORT", 35000))
 GAUGE_UPDATE_INTERVAL = 1.0 / 60.0
 ASSETS_ICONS_PATH = "./assets/icons/"
+ASSETS_ICONS_PATH = "./assets/icons/"
 ASSETS_FONTS_PATH = "./assets/fonts"
+MAX_GAUGES = 6
 
 class PID(Enum):
     BARO = "BAROMETRIC_PRESSURE"
@@ -257,10 +259,34 @@ def start_obd_polling():
 
     print("[*] Starting Ultra-Fast Batch Polling...")
 
+    # Monitor Config Changes in Loop
+    # We'll use a simple counter to check every N loops
     loop_count = 0
     
     while True:
         try:
+            # Check for config reload (if main thread handled it, we just need to refresh lists)
+            # Actually, the polling loop needs to know if PIDs changed.
+            # We can check a shared flag or just check the config object directly.
+            # Since ConfigManager is thread-safe effectively (GIL), we can check shared lists.
+            pass # We will re-read PIDs from global config every loop or periodically
+            
+            # Re-read PIDs every 60 cycles (~1 sec) to catch updates
+            if loop_count % 60 == 0:
+                 # Update lists from config manager (which might have been reloaded by main thread)
+                 # Note: ConfigManager might be reloaded by the UI thread, so we just read get().
+                 
+                 # Optimization: Only regenerate commands if lists changed
+                 new_fast = [getattr(PID, k) for k in config_manager.get("fast_pids") if hasattr(PID, k)]
+                 new_slow = [getattr(PID, k) for k in config_manager.get("slow_pids") if hasattr(PID, k)]
+                 
+                 if new_fast != FAST_PIDS or new_slow != SLOW_PIDS:
+                     print("[*] Polling Loop: Detected PID list change. Regenerating commands.")
+                     FAST_PIDS[:] = new_fast
+                     SLOW_PIDS[:] = new_slow
+                     batch_1_cmd = generate_batch_cmd(FAST_PIDS)
+                     batch_2_cmd = generate_batch_cmd(SLOW_PIDS)
+
             # --- POLL FAST BATCH ---
             s.send(batch_1_cmd)
             buffer = b""
@@ -568,15 +594,22 @@ class GaugeScreen(Screen):
             entry = DRIVER_ASSISTS_STATE[w]
             warning_box = WarningBox(entry["name"], icon_source=entry["icon"], message=entry["value"], assist=w)
             warnings_layout.add_widget(warning_box)
-        rpm_bar = RPMBar(size_hint=(1, 1))
+        
+        # RPM Bar (Conditional)
+        self.rpm_bar = RPMBar(size_hint=(1, 1))
         
         # Settings Button
         settings_btn = Button(text="CONFIG", size_hint=(None, 1), width=80, background_color=(0.2, 0.2, 0.2, 1))
         settings_btn.bind(on_release=self.go_to_settings)
         
         header_layout.add_widget(warnings_layout)
-        header_layout.add_widget(rpm_bar)
+        
+        if config_manager.get("show_rpm_bar", True):
+             header_layout.add_widget(self.rpm_bar)
+             
         header_layout.add_widget(settings_btn)
+        
+        self.header_layout = header_layout # Keep ref
         
         self.gauges = []
         self.pid_to_gauge = {}
@@ -589,7 +622,56 @@ class GaugeScreen(Screen):
         root.add_widget(header_layout)
         root.add_widget(gauges_layout)
         self.add_widget(root)
+        
+        self.gauges_layout = gauges_layout # Keep reference for rebuild
+        
         Clock.schedule_interval(self.update_all_gauges, GAUGE_UPDATE_INTERVAL)
+        
+    def rebuild_ui(self):
+        print("[*] GaugeScreen: Rebuilding UI...")
+        self.gauges_layout.clear_widgets()
+        self.gauges = []
+        self.pid_to_gauge = {}
+        
+        # Reload keys
+        # Reload keys
+        global GAUGES_TO_SHOW, WARNINGS_TO_SHOW
+        keys = config_manager.get("gauges")
+        # Safety: Truncate to MAX_GAUGES to prevent crash
+        if len(keys) > MAX_GAUGES:
+             print(f"[!] Warning: Config has {len(keys)} gauges. Truncating to {MAX_GAUGES}.")
+             keys = keys[:MAX_GAUGES]
+             
+        GAUGES_TO_SHOW = [getattr(PID, k) for k in keys if hasattr(PID, k)]
+        
+        w_keys = config_manager.get("warnings")
+        WARNINGS_TO_SHOW = [getattr(AssistKey, k) for k in w_keys if hasattr(AssistKey, k)]
+        
+        # Rebuild Header (Warnings + RPM Bar)
+        self.header_layout.clear_widgets()
+        
+        warnings_layout = BoxLayout(size_hint=(None, 1), width=120 * len(WARNINGS_TO_SHOW), spacing=10, padding=5)
+        for w in WARNINGS_TO_SHOW:
+               entry = DRIVER_ASSISTS_STATE[w]
+               warning_box = WarningBox(entry["name"], icon_source=entry["icon"], message=entry["value"], assist=w)
+               warnings_layout.add_widget(warning_box)
+        
+        settings_btn = Button(text="CONFIG", size_hint=(None, 1), width=80, background_color=(0.2, 0.2, 0.2, 1))
+        settings_btn.bind(on_release=self.go_to_settings)
+
+        self.header_layout.add_widget(warnings_layout)
+        if config_manager.get("show_rpm_bar", True):
+            self.header_layout.add_widget(self.rpm_bar)
+        self.header_layout.add_widget(settings_btn)
+
+        
+        for pid in GAUGES_TO_SHOW:
+            entry = DATA[pid]
+            gauge = GaugeWidget(entry["unit"], entry["icon"], str(entry["dial_min"]), str(entry["dial_max"]))
+            self.pid_to_gauge[pid] = gauge
+            self.gauges.append(gauge)
+            self.gauges_layout.add_widget(gauge)
+
     def update_all_gauges(self, dt):
         for pid, gauge in self.pid_to_gauge.items(): self.update_gauge(pid, gauge)
     
@@ -626,7 +708,29 @@ class DigitalScreen(Screen):
             self.pid_to_cell[pid] = cell
             grid.add_widget(cell)
         self.add_widget(grid)
+        self.grid = grid # Keep reference
         Clock.schedule_interval(self.update_all_cells, GAUGE_UPDATE_INTERVAL)  
+
+    def rebuild_ui(self):
+        print("[*] DigitalScreen: Rebuilding UI...")
+        self.grid.clear_widgets()
+        self.pid_to_cell = {}
+        
+        # Reload keys
+        global DATACELLS_TO_SHOW
+        keys = config_manager.get("datacells")
+        DATACELLS_TO_SHOW = [getattr(PID, k) for k in keys if hasattr(PID, k)]
+        
+        for idx, pid in enumerate(DATACELLS_TO_SHOW):
+            info = DATA[pid]
+            row = idx // 3
+            col = idx % 3
+            draw_top = row != 0
+            draw_left = col != 0
+            cell = DataCell(f'{info["name"]} ({info["unit"]})', info["value"], info["min_read"], info["max_read"], draw_top=draw_top, draw_left=draw_left)
+            self.pid_to_cell[pid] = cell
+            self.grid.add_widget(cell)
+
     def update_all_cells(self, dt):
         global DATA
         for pid, cell in self.pid_to_cell.items():
@@ -655,7 +759,6 @@ class SettingsScreen(Screen):
         content.bind(minimum_height=content.setter('height'))
 
         # 1. Configurable Gauges
-        content.add_widget(Label(text="Active Gauges", size_hint_y=None, height=40, font_size=24))
         self.gauge_toggles = {}
         gauges_grid = GridLayout(cols=3, spacing=5, size_hint_y=None)
         gauges_grid.bind(minimum_height=gauges_grid.setter('height'))
@@ -666,13 +769,59 @@ class SettingsScreen(Screen):
             chk = CheckBox(active=(pid_name in current_gauges))
             box.add_widget(chk)
             box.add_widget(Label(text=pid_name))
+            box.add_widget(Label(text=pid_name))
+            chk.bind(active=self.on_gauge_toggle)
             self.gauge_toggles[pid_name] = chk
             gauges_grid.add_widget(box)
-        
         content.add_widget(gauges_grid)
+        
+        # Enforce initial state
+        self.update_gauge_locks()
 
-        # 2. Redline
-        content.add_widget(Label(text="Redline RPM", size_hint_y=None, height=40, font_size=24))
+        # 2. Configurable DataCells
+        content.add_widget(Label(text="Active Digital Cells", size_hint_y=None, height=40, font_size=24))
+        self.datacell_toggles = {}
+        datacell_grid = GridLayout(cols=3, spacing=5, size_hint_y=None)
+        datacell_grid.bind(minimum_height=datacell_grid.setter('height'))
+        
+        current_datacells = config_manager.get("datacells")
+        for pid_name in PID.__members__:
+            box = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+            chk = CheckBox(active=(pid_name in current_datacells))
+            box.add_widget(chk)
+            box.add_widget(Label(text=pid_name))
+            self.datacell_toggles[pid_name] = chk
+            datacell_grid.add_widget(box)
+        content.add_widget(datacell_grid)
+
+        # 3. Driver Assists
+        content.add_widget(Label(text="Active Assists/Warnings", size_hint_y=None, height=40, font_size=24))
+        self.assist_toggles = {}
+        assist_grid = GridLayout(cols=2, spacing=5, size_hint_y=None)
+        assist_grid.bind(minimum_height=assist_grid.setter('height'))
+        
+        current_warnings = config_manager.get("warnings")
+        for assist_key in AssistKey.__members__:
+            box = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+            chk = CheckBox(active=(assist_key in current_warnings))
+            box.add_widget(chk)
+            box.add_widget(Label(text=assist_key))
+            self.assist_toggles[assist_key] = chk
+            assist_grid.add_widget(box)
+        content.add_widget(assist_grid)
+
+        # 4. General Settings
+        content.add_widget(Label(text="General", size_hint_y=None, height=40, font_size=24))
+        
+        # RPM Bar
+        rpm_box = BoxLayout(orientation='horizontal', size_hint_y=None, height=40)
+        self.rpm_bar_chk = CheckBox(active=config_manager.get("show_rpm_bar", True))
+        rpm_box.add_widget(self.rpm_bar_chk)
+        rpm_box.add_widget(Label(text="Show RPM Bar"))
+        content.add_widget(rpm_box)
+
+        # Redline
+        content.add_widget(Label(text="Redline RPM", size_hint_y=None, height=40))
         self.redline_input = TextInput(text=str(config_manager.get("redline")), multiline=False, size_hint_y=None, height=40)
         content.add_widget(self.redline_input)
         
@@ -685,6 +834,19 @@ class SettingsScreen(Screen):
         self.layout.add_widget(scroll)
         self.add_widget(self.layout)
 
+    def on_gauge_toggle(self, instance, value):
+        self.update_gauge_locks()
+        
+    def update_gauge_locks(self):
+        active_count = sum(1 for chk in self.gauge_toggles.values() if chk.active)
+        
+        disable_others = active_count >= MAX_GAUGES
+        
+        for chk in self.gauge_toggles.values():
+            if not chk.active:
+                chk.disabled = disable_others
+                chk.opacity = 0.5 if disable_others else 1.0
+
     def go_back(self, *args):
         self.manager.current = 'gauge'
         self.manager.transition.direction = 'right'
@@ -693,6 +855,17 @@ class SettingsScreen(Screen):
         # Update Gauges
         new_gauges = [k for k, v in self.gauge_toggles.items() if v.active]
         config_manager.set("gauges", new_gauges)
+        
+        # Update DataCells
+        new_datacells = [k for k, v in self.datacell_toggles.items() if v.active]
+        config_manager.set("datacells", new_datacells)
+        
+        # Update Warnings/Assists
+        new_warnings = [k for k, v in self.assist_toggles.items() if v.active]
+        config_manager.set("warnings", new_warnings)
+        
+        # Update RPM Bar
+        config_manager.set("show_rpm_bar", self.rpm_bar_chk.active)
         
         # Update Redline
         try:
@@ -726,8 +899,23 @@ class RootWidget(ScreenManager):
             self.current = name
 
 class DashApp(App):
-    def build(self): return RootWidget()
-    def on_start(self): threading.Thread(target=start_obd_polling, daemon=True).start()
+    def build(self):
+        self.root_widget = RootWidget()
+        Clock.schedule_interval(self.check_config_updates, 1.0)
+        return self.root_widget
+        
+    def on_start(self): 
+        threading.Thread(target=start_obd_polling, daemon=True).start()
+        
+    def check_config_updates(self, dt):
+        if config_manager.check_for_changes():
+            print("[*] App: Detected config change. Triggering UI Rebuild.")
+            # Trigger rebuild on screens
+            gauge_scr = self.root_widget.get_screen('gauge')
+            if hasattr(gauge_scr, 'rebuild_ui'): gauge_scr.rebuild_ui()
+            
+            digit_scr = self.root_widget.get_screen('digital')
+            if hasattr(digit_scr, 'rebuild_ui'): digit_scr.rebuild_ui()
 
 if __name__ == '__main__':
     DashApp().run()

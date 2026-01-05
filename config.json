@@ -1,14 +1,12 @@
 {
     "gauges": [
         "BOOST",
-        "IAT",
         "TIMING",
-        "COOLANT_TEMP",
         "OIL_TEMP",
-        "VOLTAGE"
+        "THROTTLE",
+        "LOAD"
     ],
     "datacells": [
-        "BOOST",
         "IAT",
         "TIMING",
         "COOLANT_TEMP",
@@ -17,7 +15,6 @@
     ],
     "redline": 5500,
     "warnings": [
-        "WARMUP_STATUS",
         "BATTERY_STATUS",
         "ECO_STATUS",
         "SHIFT_HINT",
@@ -39,5 +36,6 @@
         "LTFT",
         "VOLTAGE",
         "LOAD"
-    ]
+    ],
+    "show_rpm_bar": false
 }
